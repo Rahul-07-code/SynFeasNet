@@ -18,13 +18,21 @@ class SMILESTokenizer:
             f"max_length={max_length}"
         )
 
-    def __call__(self, smiles, device=None) -> dict:
+    def __call__(self, smiles, device=None, dynamic_truncation: bool = True) -> dict:
         if isinstance(smiles, str):
             smiles = [smiles]
 
+        # Dynamic truncation: use minimum of self.max_length or the actual required length
+        # to save memory during batch processing.
+        curr_max = self.max_length
+        if dynamic_truncation and isinstance(smiles, list) and len(smiles) > 0:
+            # Heuristic: max length of this specific batch
+            actual_max = max([len(s) for s in smiles]) 
+            curr_max = min(self.max_length, actual_max + 2) # small buffer
+
         encoded = self.tokenizer(
             smiles,
-            max_length=self.max_length,
+            max_length=curr_max,
             padding="max_length",
             truncation=True,
             return_tensors="pt",

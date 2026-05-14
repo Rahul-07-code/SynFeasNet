@@ -369,14 +369,25 @@ def main(args):
 
     # ── Column name detection ─────────────────────────────────────────────
     print("\nDetected scoring columns:")
-    for field, alts in [
-        ("sascore",    ["sascore",    "SAscore", "sa_score",   "SA"]),
-        ("scscore",    ["scscore",    "SCScore",  "sc_score",   "SC"]),
-        ("syba_score", ["syba_score", "SYBA",     "syba",       "syba_score"]),
-        ("source",     ["source",     "Source",   "data_source"]),
-    ]:
+    # Map the internal names (sascore, scscore, syba_score) to your actual CSV columns
+    column_mapping = {
+        "sascore":    ["sa_score_proxy", "sascore", "SAscore", "sa_score", "SA"],
+        "scscore":    ["synthesis_feasibility_v2", "scscore", "SCScore", "sc_score", "SC"],
+        "syba_score": ["p_synthesizable", "syba_score", "SYBA", "syba"],
+        "source":     ["source", "Source", "data_source"],
+    }
+    
+    found_cols = {}
+    for internal, alts in column_mapping.items():
         found = next((c for c in alts if c in df.columns), None)
-        print(f"  {field:12s}: {'found as ' + found if found else 'NOT FOUND (will be NaN)'}")
+        found_cols[internal] = found
+        print(f"  {internal:12s}: {'found as ' + found if found else 'NOT FOUND (will be NaN)'}")
+
+    # Rename the columns to the internal names so assign_label() works without modification
+    for internal, actual in found_cols.items():
+        if actual and actual != internal:
+            df = df.rename(columns={actual: internal})
+
 
     # ── Validate SMILES + Assign Labels ───────────────────────────────────
     print("\nValidating SMILES and assigning labels...")

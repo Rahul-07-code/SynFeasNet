@@ -237,13 +237,15 @@ class ANNBranch(nn.Module):
     """
 
     def __init__(self,
-                 fp_dim:   int   = 2048,
-                 desc_dim: int   = 208,
-                 dropout:  float = 0.3):
+                  fp_dim:   int   = 2048,
+                  desc_dim: int   = 208,
+                  dropout:  float = 0.3):
         super(ANNBranch, self).__init__()
 
         input_dim = fp_dim + desc_dim   # 2256
 
+        # Optimized capacity: Matching checkpoint dimensions
+        # 2256 -> 1024 -> 512 -> 256
         self.network = nn.Sequential(
             nn.Linear(input_dim, 1024),
             nn.BatchNorm1d(1024),
@@ -260,6 +262,7 @@ class ANNBranch(nn.Module):
         )
 
         self._init_weights()
+
 
     def _init_weights(self):
         for layer in self.modules():

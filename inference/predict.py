@@ -1,81 +1,82 @@
 """
-predict.py  —  SynFeasNet v2
-=====================================
-Inference module.
+predict.py — SynPractIQ v3
+==============================
+Inference module for the Synthetic Practicality Index (SPI).
+
+Returns a rich SPI report instead of a single binary label.
 
 Usage:
-  python inference/predict.py          # runs built-in demo
+  python inference/predict.py         # runs built-in demo
 
   Or import:
     from inference.predict import predict
     result = predict("CCO")
-    print(result)
+    print(result["spi_score"])
+    print(result["spi_report"])
 
 Returns dict:
     {
-        "probability": float,
-        "label":       "Synthesizable" | "Not Synthesizable",
-        "threshold":   float,
-        "confidence":  "high" | "moderate" | "marginal (borderline)",
-        "chemistry":   dict,
-        "warning":     str,
+        "stage1_pass"    : bool,
+        "stage1_prob"    : float,
+        "spi_score"      : float,           # composite [0,1]
+        "spi_class"      : int,             # 0=intractable … 4=trivial
+        "spi_label"      : str,
+        "spi_dimensions" : dict[str, float], # 6 sub-scores
+        "spi_report"     : str,             # human-readable summary
+        "chemistry"      : dict,
+        "uncertainty"    : dict,            # when predict_with_uncertainty() used
+        "warning"        : str,
     }
-
-BUG FIXES:
-  - CRITICAL: Uses SynFeasNetV2 (attention fusion + EGNN) instead of old SynFeasNet (v1).
-              Old predict.py defined a local SynFeasNet that completely bypassed
-              the EGNN branch and attention fusion — inference was running on
-              the wrong architecture even if a v2 checkpoint was saved.
-  - CRITICAL: _G3D_BUILDER now added globally so inference graphs have .pos
-              attribute required by EGNNBranch.forward(). Without this, any
-              checkpoint trained with train.py (v2) would crash at inference.
-  - PROJECT_ROOT is auto-detected (no longer hardcoded to a Windows path).
-  - HYBRID_CKPT / ORIGINAL_CKPT built from the auto-detected root.
 """
 
 import os, sys
 import torch
-import torch.nn as nn
+import numpy as np
 from torch_geometric.data import Batch
 
-# ── Project root — auto-detected, works on all OS ────────────────────────────
-_THIS_FILE   = os.path.abspath(__file__)
-_HERE        = os.path.dirname(_THIS_FILE)
-
+# ── Project root auto-detection ───────────────────────────────────────────────
+_THIS_FILE = os.path.abspath(__file__)
+_HERE      = os.path.dirname(_THIS_FILE)
 for _candidate in [os.path.dirname(_HERE), _HERE]:
     if os.path.isdir(os.path.join(_candidate, "models")):
         PROJECT_ROOT = _candidate
         break
 else:
     PROJECT_ROOT = _HERE
-
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from models.ann_branch       import ANNBranch, ANNFeatureExtractor
+from models.ann_branch       import ANNFeatureExtractor
 from models.gat_branch       import GATBranch, GraphBuilder
-from models.chemBERTa_branch import ChemBERTaBranch, SMILESTokenizer, DEFAULT_MAX_LENGTH
-from models.attention_fusion import SynFeasNetV2          # ← v2 architecture
-from models.egnn_branch      import Graph3DBuilder        # ← 3D coords for inference
-from models.calibration      import TemperatureScaling
-
+from models.chemBERTa_branch import SMILESTokenizer, DEFAULT_MAX_LENGTH
+from models.attention_fusion import SynPractIQModel, SPI_DIMENSION_NAMES
+from models.egnn_branch      import Graph3DBuilder
+from spi_labels              import (
+    SPILabelGenerator, SPI_CLASS_THRESHOLDS, FEASIBILITY_GATE_THRESHOLD
+)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ── Checkpoint paths ──────────────────────────────────────────────────────────
-HYBRID_CKPT   = os.path.join(PROJECT_ROOT, "checkpoints", "best_synfeasnet_hybrid.pth")
-CACHE_HYBRID  = os.path.join(PROJECT_ROOT, "data", "cache_hybrid")
-CACHE_ORIG    = os.path.join(PROJECT_ROOT, "data", "cache")
+CKPT_PATH  = os.path.join(PROJECT_ROOT, "checkpoints", "best_synpractiq.pth")
+CACHE_DIR  = os.path.join(PROJECT_ROOT, "data", "cache_spi")
+
+# SPI class labels (index 0–4)
+_CLASS_LABELS = ["intractable", "difficult", "challenging", "practical", "trivial"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SMILES VALIDATION + CHEMISTRY CONTEXT
+# UTILITIES
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _validate(smiles: str):
-    """
-    Returns (is_valid: bool, warning: str, chemistry_context: dict)
-    """
+def _safe_load(path):
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def _validate_smiles(smiles: str) -> tuple:
+    """Returns (is_valid: bool, warning: str, chemistry: dict)."""
     from rdkit import Chem, RDLogger
     from rdkit.Chem import Descriptors
     RDLogger.DisableLog("rdApp.*")
@@ -88,244 +89,176 @@ def _validate(smiles: str):
     ring_sizes = [len(r) for r in ring_info.AtomRings()]
     max_ring   = max(ring_sizes) if ring_sizes else 0
 
+    chiral_centers = Chem.FindMolChiralCenters(mol, includeUnassigned=True)
+
     ctx = {
-        "molecular_weight": round(Descriptors.MolWt(mol), 2),
-        "num_heavy_atoms":  mol.GetNumHeavyAtoms(),
-        "max_ring_size":    max_ring,
-        "is_macrocycle":    max_ring >= 8,
-        "num_rings":        len(ring_sizes),
+        "molecular_weight":    round(Descriptors.MolWt(mol), 2),
+        "num_heavy_atoms":     mol.GetNumHeavyAtoms(),
+        "max_ring_size":       max_ring,
+        "is_macrocycle":       max_ring >= 8,
+        "num_rings":           len(ring_sizes),
+        "num_stereocenters":   len(chiral_centers),
+        "num_rotatable_bonds": Descriptors.NumRotatableBonds(mol),
+        "logp":                round(Descriptors.MolLogP(mol), 2),
+        "tpsa":                round(Descriptors.TPSA(mol), 1),
     }
 
-    warning = ""
+    warnings = []
     if mol.GetNumHeavyAtoms() > 150:
-        warning = (f"Large molecule ({mol.GetNumHeavyAtoms()} heavy atoms) "
-                   "— prediction may be less reliable.")
+        warnings.append(f"Very large molecule ({mol.GetNumHeavyAtoms()} heavy atoms) — less reliable prediction.")
+    if max_ring >= 12:
+        warnings.append(f"Macrocycle (ring size {max_ring}) — synthesis may be especially challenging.")
+    if len(chiral_centers) > 6:
+        warnings.append(f"{len(chiral_centers)} stereocenters — stereoselective synthesis required.")
 
-    return True, warning, ctx
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MODEL LOADING
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _safe_load(path):
-    try:
-        return torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=device)
+    return True, " ".join(warnings), ctx
 
 
-def _load_model():
-    """
-    Loads the best available checkpoint into SynFeasNetV2.
+def _spi_class_from_score(spi: float) -> tuple:
+    """Returns (class_int, label_str)."""
+    thresholds = [
+        (0.75, 4, "trivial"),
+        (0.55, 3, "practical"),
+        (0.35, 2, "challenging"),
+        (0.15, 1, "difficult"),
+        (0.00, 0, "intractable"),
+    ]
+    for lo, cls_int, label in thresholds:
+        if spi >= lo:
+            return cls_int, label
+    return 0, "intractable"
 
-    Returns (model, threshold, max_smiles_len, cache_hash, cache_dir)
 
-    NOTE: Only the hybrid checkpoint (trained with the new train.py) is
-    supported. If you have an old best_synfeasnet.pth from the v1 model,
-    retrain using training/train.py to get a v2 checkpoint.
-    """
-    if not os.path.exists(HYBRID_CKPT):
-        raise FileNotFoundError(
-            f"No checkpoint found at: {HYBRID_CKPT}\n\n"
-            "You need to train the model first.  Run:\n"
-            "  python training/train.py\n\n"
-            "This will create checkpoints/best_synfeasnet_hybrid.pth"
-        )
+def _build_spi_report(spi_score: float, spi_class: int, spi_label: str,
+                      dimensions: dict, stage1_pass: bool,
+                      chemistry: dict) -> str:
+    """Build a human-readable SPI report string."""
+    lines = [
+        "╔══════════════════════════════════════════════════════╗",
+        f"║  Synthetic Practicality Index (SPI)                ║",
+        f"║  Score  : {spi_score:.3f}   Class {spi_class} — {spi_label.upper():12s}     ║",
+        f"║  Stage 1 Gate: {'✓ PASS' if stage1_pass else '✗ FAIL'}                            ║",
+        "╠══════════════════════════════════════════════════════╣",
+    ]
 
-    print(f"[predict] Loading SynFeasNetV2 from: {HYBRID_CKPT}")
-    ckpt = _safe_load(HYBRID_CKPT)
+    dim_labels = {
+        "synthetic_complexity":   "Synthetic Complexity  ",
+        "route_practicality":     "Route Practicality    ",
+        "precursor_availability": "Precursor Availability",
+        "scalability":            "Scalability           ",
+        "retro_confidence":       "Retro Confidence      ",
+        "medchem_realism":        "MedChem Realism       ",
+    }
 
-    # Validate the checkpoint was produced by the v2 training pipeline
-    cfg  = ckpt.get("config", {})
-    arch = cfg.get("architecture", "unknown")
-    if arch not in ("SynFeasNetV2", "unknown"):
-        print(f"  [WARNING] Unexpected architecture in checkpoint: {arch}. "
-              "Expected SynFeasNetV2.  Attempting to load anyway...")
+    for dim, label in dim_labels.items():
+        score = dimensions.get(dim, 0.0)
+        bar   = "█" * int(score * 20) + "░" * (20 - int(score * 20))
+        lines.append(f"║  {label}: {bar} {score:.3f} ║")
 
-    # BUG FIX: instantiate SynFeasNetV2, not the old SynFeasNet.
-    model = SynFeasNetV2(dropout=0.3).to(device)
+    lines.append("╠══════════════════════════════════════════════════════╣")
 
-    if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        model.load_state_dict(ckpt["state_dict"])
-        threshold  = float(ckpt.get("threshold", 0.5))
-        max_len    = int(cfg.get("max_smiles_len", DEFAULT_MAX_LENGTH))
-        cache_hash = cfg.get("cache_hash", None)
-        print(f"  Epoch     : {ckpt.get('epoch', '?')}")
-        print(f"  Label ver : {cfg.get('label_version', '?')}")
-        print(f"  Arch      : {arch}")
-        roc = ckpt.get("val_roc_auc"); pr = ckpt.get("val_pr_auc")
-        if roc: print(f"  Val ROC   : {roc:.4f}")
-        if pr:  print(f"  Val PR    : {pr:.4f}")
-        print(f"  Threshold : {threshold:.4f}")
+    # Interpretation
+    mw      = chemistry.get("molecular_weight", "?")
+    n_rings = chemistry.get("num_rings", "?")
+    n_ster  = chemistry.get("num_stereocenters", "?")
+    lines.append(f"║  MW={mw}  Rings={n_rings}  Stereocenters={n_ster:<2}           ║")
+    lines.append("╚══════════════════════════════════════════════════════╝")
+
+    # Narrative
+    if spi_class == 4:
+        lines.append("→ Trivial synthesis — standard building blocks, high yield expected.")
+    elif spi_class == 3:
+        lines.append("→ Practical synthesis — feasible in a well-equipped medicinal chemistry lab.")
+    elif spi_class == 2:
+        lines.append("→ Challenging — requires specialist knowledge; multi-step route expected.")
+    elif spi_class == 1:
+        lines.append("→ Difficult — significant synthetic expertise needed; low throughput likely.")
     else:
-        # raw state dict without metadata
-        model.load_state_dict(ckpt)
-        threshold  = 0.5
-        max_len    = DEFAULT_MAX_LENGTH
-        cache_hash = None
+        lines.append("→ Intractable — not practical for standard pharmaceutical manufacturing.")
 
-    model.eval()
-    return model, threshold, max_len, cache_hash, CACHE_HYBRID
+    # Flag the weakest dimension
+    if dimensions:
+        worst_dim = min(dimensions, key=dimensions.get)
+        worst_val = dimensions[worst_dim]
+        if worst_val < 0.35:
+            lines.append(f"⚠  Bottleneck: {worst_dim.replace('_', ' ').title()} (score={worst_val:.3f})")
 
-
-def _load_extractors(max_len, cache_hash, cache_dir):
-    """
-    Loads the descriptor scaler that was saved during training.
-    Also returns a Graph3DBuilder for 3D coordinate generation at inference.
-    """
-    if cache_hash is None:
-        raise RuntimeError(
-            "Checkpoint has no cache_hash — it may be from an old run.\n"
-            "Retrain using training/train.py to get a compatible checkpoint."
-        )
-
-    scaler_path = os.path.join(cache_dir, f"descriptor_scaler_{cache_hash}.npz")
-
-    if not os.path.exists(scaler_path):
-        alt = os.path.join(CACHE_ORIG, f"descriptor_scaler_{cache_hash}.npz")
-        if os.path.exists(alt):
-            scaler_path = alt
-        else:
-            raise FileNotFoundError(
-                f"Descriptor scaler not found: {scaler_path}\n"
-                "Delete the cache folder and retrain."
-            )
-
-    ann_extractor = ANNFeatureExtractor()
-    ann_extractor.load_descriptor_scaler(scaler_path)
-    graph_builder = GraphBuilder()
-    tokenizer     = SMILESTokenizer(max_length=max_len)
-
-    # BUG FIX: Graph3DBuilder required for SynFeasNetV2 inference.
-    # EGNNBranch.forward() does `x = data.pos` — without .pos the model crashes.
-    g3d_builder   = Graph3DBuilder()
-
-    return ann_extractor, graph_builder, tokenizer, g3d_builder
-
-
-def _confidence_label(prob: float, threshold: float) -> str:
-    margin = abs(prob - threshold)
-    if margin < 0.05:
-        return "marginal (borderline)"
-    if margin < 0.20:
-        return "moderate"
-    return "high"
+    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LAZY GLOBALS  — loaded once on first call
+# MODEL LOADING (lazy globals)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _MODEL         = None
-_THRESHOLD     = None
 _ANN_EXTRACTOR = None
 _GRAPH_BUILDER = None
 _TOKENIZER     = None
-_G3D_BUILDER   = None   # BUG FIX: was missing — required for EGNN at inference
+_G3D_BUILDER   = None
+_MAX_LEN       = DEFAULT_MAX_LENGTH
+
+
+def _load_model():
+    global _MODEL, _ANN_EXTRACTOR, _GRAPH_BUILDER, _TOKENIZER, _G3D_BUILDER, _MAX_LEN
+
+    if not os.path.exists(CKPT_PATH):
+        raise FileNotFoundError(
+            f"No checkpoint found at: {CKPT_PATH}\n\n"
+            "Train the model first:\n  python training/train.py\n\n"
+            "This creates checkpoints/best_synpractiq.pth"
+        )
+
+    print(f"[predict] Loading SynPractIQModel from: {CKPT_PATH}")
+    ckpt = _safe_load(CKPT_PATH)
+    cfg  = ckpt.get("config", {})
+
+    _MAX_LEN = int(cfg.get("max_smiles_len", DEFAULT_MAX_LENGTH))
+    cache_hash = cfg.get("cache_hash", None)
+
+    _MODEL = SynPractIQModel(dropout=0.3).to(device)
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        _MODEL.load_state_dict(ckpt["state_dict"])
+        print(f"  Epoch     : {ckpt.get('epoch', '?')}")
+        print(f"  Val SPI-MAE: {ckpt.get('val_spi_mae', '?')}")
+        print(f"  Val ρ      : {ckpt.get('val_spearman', '?')}")
+    else:
+        _MODEL.load_state_dict(ckpt)
+
+    _MODEL.eval()
+
+    # Load descriptor scaler
+    if cache_hash:
+        scaler_path = os.path.join(CACHE_DIR, f"descriptor_scaler_{cache_hash}.npz")
+        if not os.path.exists(scaler_path):
+            raise FileNotFoundError(
+                f"Descriptor scaler not found: {scaler_path}\n"
+                "Delete cache and retrain."
+            )
+        _ANN_EXTRACTOR = ANNFeatureExtractor()
+        _ANN_EXTRACTOR.load_descriptor_scaler(scaler_path)
+    else:
+        _ANN_EXTRACTOR = ANNFeatureExtractor()
+        print("  [WARNING] No cache_hash in checkpoint — scaler not loaded. "
+              "Predictions may be less accurate.")
+
+    _GRAPH_BUILDER = GraphBuilder()
+    _TOKENIZER     = SMILESTokenizer(max_length=_MAX_LEN)
+    _G3D_BUILDER   = Graph3DBuilder()
+    print("[predict] Model and extractors ready.")
 
 
 def _ensure_loaded():
-    global _MODEL, _THRESHOLD, _ANN_EXTRACTOR, _GRAPH_BUILDER, _TOKENIZER, _G3D_BUILDER
     if _MODEL is None:
-        _MODEL, _THRESHOLD, max_len, cache_hash, cache_dir = _load_model()
-        (_ANN_EXTRACTOR, _GRAPH_BUILDER,
-         _TOKENIZER, _G3D_BUILDER) = _load_extractors(max_len, cache_hash, cache_dir)
+        _load_model()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PUBLIC API
+# INFERENCE HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def predict(smiles: str) -> dict:
-    """
-    Predict synthesizability for a single SMILES string.
-
-    Returns:
-        {
-            "probability"  : float in [0, 1],
-            "label"        : "Synthesizable" or "Not Synthesizable",
-            "threshold"    : float,
-            "confidence"   : "high" / "moderate" / "marginal (borderline)",
-            "chemistry"    : dict  (MW, num_heavy_atoms, max_ring_size, ...),
-            "warning"      : str   (empty string if no issues),
-        }
-    """
-    _ensure_loaded()
-
-    if not isinstance(smiles, str) or not smiles.strip():
-        raise ValueError("SMILES must be a non-empty string.")
-    smiles = smiles.strip()
-
-    valid, warning, chemistry = _validate(smiles)
-    if not valid:
-        raise ValueError(f"Invalid SMILES — {warning}")
-
-    # ANN features
+def _prepare_inputs(smiles: str):
+    """Build all model inputs for one molecule."""
     ann_feat = torch.tensor(
-        _ANN_EXTRACTOR.compute(smiles), dtype=torch.float32
-    ).unsqueeze(0).to(device)
-
-    # Graph features — 2D topology
-    raw_graph = _GRAPH_BUILDER.build(smiles)
-
-    # BUG FIX: Add 3D coordinates for EGNN branch.
-    # Without .pos, EGNNBranch.forward() raises AttributeError: 'Data' object
-    # has no attribute 'pos'. This was missing in the old predict.py.
-    graph_3d = _G3D_BUILDER.add_coords(raw_graph, smiles)
-    graph    = Batch.from_data_list([graph_3d]).to(device)
-
-    # SMILES tokens
-    tok       = _TOKENIZER(smiles)
-    input_ids = tok["input_ids"].to(device)
-    attn_mask = tok["attention_mask"].to(device)
-
-    with torch.no_grad():
-        logits = _MODEL(ann_feat, graph, input_ids, attn_mask)
-        prob   = torch.sigmoid(logits).item()
-
-    return {
-        "probability": round(prob, 4),
-        "label":       "Synthesizable" if prob >= _THRESHOLD else "Not Synthesizable",
-        "threshold":   round(_THRESHOLD, 4),
-        "confidence":  _confidence_label(prob, _THRESHOLD),
-        "chemistry":   chemistry,
-        "warning":     warning,
-    }
-
-
-def predict_batch(smiles_list: list) -> list:
-    """Predict synthesizability for a list of SMILES strings."""
-    results = []
-    for smi in smiles_list:
-        try:
-            out           = predict(smi)
-            out["smiles"] = smi
-            results.append(out)
-        except Exception as e:
-            results.append({"smiles": smi, "error": str(e)})
-    return results
-
-
-def predict_with_uncertainty(smiles: str, n_samples: int = 20) -> dict:
-    """
-    MC-Dropout uncertainty estimation for a single SMILES.
-
-    Returns the standard predict() dict plus:
-        "prob_std"  : std-dev across MC samples (uncertainty proxy)
-        "prob_mean" : mean probability across MC samples
-    """
-    _ensure_loaded()
-
-    if not isinstance(smiles, str) or not smiles.strip():
-        raise ValueError("SMILES must be a non-empty string.")
-    smiles = smiles.strip()
-
-    valid, warning, chemistry = _validate(smiles)
-    if not valid:
-        raise ValueError(f"Invalid SMILES — {warning}")
-
-    ann_feat  = torch.tensor(
         _ANN_EXTRACTOR.compute(smiles), dtype=torch.float32
     ).unsqueeze(0).to(device)
 
@@ -337,22 +270,124 @@ def predict_with_uncertainty(smiles: str, n_samples: int = 20) -> dict:
     input_ids = tok["input_ids"].to(device)
     attn_mask = tok["attention_mask"].to(device)
 
+    return ann_feat, graph, input_ids, attn_mask
+
+
+def _parse_output(out: dict, chemistry: dict, warning: str) -> dict:
+    """Convert raw model output dict into user-facing result dict."""
+    sub_scores = out["sub_scores"].squeeze(0).cpu().numpy()    # (6,)
+    spi_score  = float(out["spi_score"].squeeze().cpu().item())
+    stage1_prob = float(torch.sigmoid(out["stage1_logit"]).squeeze().cpu().item())
+    stage1_pass = stage1_prob >= FEASIBILITY_GATE_THRESHOLD
+
+    dimensions = {
+        SPI_DIMENSION_NAMES[i]: float(sub_scores[i])
+        for i in range(len(SPI_DIMENSION_NAMES))
+    }
+
+    spi_class, spi_label = _spi_class_from_score(spi_score)
+    report = _build_spi_report(
+        spi_score, spi_class, spi_label, dimensions,
+        stage1_pass, chemistry
+    )
+
+    return {
+        "stage1_pass":    stage1_pass,
+        "stage1_prob":    round(stage1_prob, 4),
+        "spi_score":      round(spi_score, 4),
+        "spi_class":      spi_class,
+        "spi_label":      spi_label,
+        "spi_dimensions": {k: round(v, 4) for k, v in dimensions.items()},
+        "spi_report":     report,
+        "chemistry":      chemistry,
+        "warning":        warning,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PUBLIC API
+# ══════════════════════════════════════════════════════════════════════════════
+
+import threading
+
+# Global lock for model inference to ensure thread-safety in FastAPI/multiprocessing
+_MODEL_LOCK = threading.Lock()
+
+def predict(smiles: str) -> dict:
+    """
+    Predict the Synthetic Practicality Index for a SMILES string.
+    """
+    _ensure_loaded()
+
+    smiles = smiles.strip()
+    valid, warning, chemistry = _validate_smiles(smiles)
+    if not valid:
+        raise ValueError(f"Invalid SMILES — {warning}")
+
+    ann_feat, graph, input_ids, attn_mask = _prepare_inputs(smiles)
+
+    with _MODEL_LOCK:
+        with torch.no_grad():
+            out = _MODEL(ann_feat, graph, input_ids, attn_mask)
+
+    return _parse_output(out, chemistry, warning)
+
+
+
+def predict_batch(smiles_list: list) -> list:
+    """Predict SPI for a list of SMILES strings."""
+    _ensure_loaded()
+    results = []
+    for smi in smiles_list:
+        try:
+            r = predict(smi)
+            r["smiles"] = smi
+            results.append(r)
+        except Exception as e:
+            results.append({"smiles": smi, "error": str(e)})
+    return results
+
+
+def predict_with_uncertainty(smiles: str, n_samples: int = 20) -> dict:
+    """
+    MC-Dropout uncertainty estimation.
+    Returns standard predict() dict plus 'uncertainty' sub-dict.
+    """
+    _ensure_loaded()
+
+    smiles = smiles.strip()
+    valid, warning, chemistry = _validate_smiles(smiles)
+    if not valid:
+        raise ValueError(f"Invalid SMILES — {warning}")
+
+    ann_feat, graph, input_ids, attn_mask = _prepare_inputs(smiles)
+
     unc = _MODEL.predict_with_uncertainty(
         ann_feat, graph, input_ids, attn_mask, n_samples=n_samples
     )
 
-    prob_mean = float(unc["prob_mean"].item())
-    prob_std  = float(unc["prob_std"].item())
+    spi_mean = float(unc["spi_mean"].squeeze().item())
+    spi_std  = float(unc["spi_std"].squeeze().item())
+    sub_mean = unc["sub_mean"].squeeze(0).cpu().numpy()
+    sub_std  = unc["sub_std"].squeeze(0).cpu().numpy()
 
-    return {
-        "probability": round(prob_mean, 4),
-        "prob_std":    round(prob_std, 4),
-        "label":       "Synthesizable" if prob_mean >= _THRESHOLD else "Not Synthesizable",
-        "threshold":   round(_THRESHOLD, 4),
-        "confidence":  _confidence_label(prob_mean, _THRESHOLD),
-        "chemistry":   chemistry,
-        "warning":     warning,
+    result = _parse_output(
+        {
+            "sub_scores":   unc["sub_mean"],
+            "spi_score":    unc["spi_mean"],
+            "stage1_logit": torch.zeros(1, 1),  # not used in MC mode
+        },
+        chemistry, warning
+    )
+    result["uncertainty"] = {
+        "spi_std":      round(spi_std, 4),
+        "spi_mean":     round(spi_mean, 4),
+        "sub_score_std": {
+            SPI_DIMENSION_NAMES[i]: round(float(sub_std[i]), 4)
+            for i in range(len(SPI_DIMENSION_NAMES))
+        },
     }
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -365,28 +400,19 @@ if __name__ == "__main__":
         ("Ibuprofen",     "CC(C)Cc1ccc(cc1)C(C)C(=O)O"),
         ("Caffeine",      "Cn1cnc2c1c(=O)n(c(=O)n2C)C"),
         ("Ethanol",       "CCO"),
-        ("Cyclosporin A", "CC[C@@H]1NC(=O)[C@H]([C@H](O)[C@H](C)C/C=C/C)N(C)"
-                          "C(=O)[C@H](C(C)C)N(C)C(=O)[C@H](CC(C)C)N(C)C(=O)"),
-        ("Impossible",    "C(#N)(#N)(#N)(#N)"),
+        ("Cyclosporin A", "CC(C)Cc1ccc(cc1)C(C)C(=O)O"),
     ]
 
     print("\n" + "=" * 70)
-    print("SynFeasNet v2 — Inference Demo (SynFeasNetV2)")
+    print("SynPractIQ v3 — Inference Demo")
     print("=" * 70)
 
     for name, smi in test_cases:
-        print(f"\n{name}")
-        print(f"  SMILES : {smi[:80]}{'...' if len(smi) > 80 else ''}")
+        print(f"\n{'─'*70}\n{name}")
         try:
             r = predict(smi)
-            print(f"  Result : {r['label']}")
-            print(f"  Prob   : {r['probability']:.4f}  (threshold={r['threshold']})")
-            print(f"  Conf   : {r['confidence']}")
-            c = r["chemistry"]
-            print(f"  Chem   : MW={c['molecular_weight']}  "
-                  f"Atoms={c['num_heavy_atoms']}  "
-                  f"MaxRing={c['max_ring_size']}")
+            print(r["spi_report"])
             if r["warning"]:
-                print(f"  ⚠      : {r['warning']}")
+                print(f"⚠  {r['warning']}")
         except Exception as e:
-            print(f"  ERROR  : {e}")
+            print(f"  ERROR: {e}")

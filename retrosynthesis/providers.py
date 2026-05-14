@@ -397,41 +397,53 @@ class MockRetrosynthesisProvider(RetrosynthesisProvider):
 class RetrosynthesisRouter:
     """
     Auto-selects the best available retrosynthesis provider.
-    Priority: IBM RXN → ASKCOS → Mock (fallback).
-
-    Usage:
-        router = RetrosynthesisRouter()
-        result = router.analyze("CC(=O)Oc1ccccc1C(=O)O")
+    Now implements lazy initialization to prevent startup freezes.
     """
-
     def __init__(self, ibm_api_key: str = "", askcos_url: str = "",
                  askcos_api_key: str = ""):
-        self.providers = {
-            "ibm_rxn": IBMRXNProvider(api_key=ibm_api_key),
-            "askcos": ASKCOSProvider(
-                base_url=askcos_url or "https://askcos.mit.edu/api/v2",
-                api_key=askcos_api_key,
-            ),
-            "mock": MockRetrosynthesisProvider(),
+        self.api_keys = {
+            "ibm": ibm_api_key,
+            "askcos_key": askcos_api_key,
+            "askcos_url": askcos_url or "https://askcos.mit.edu/api/v2"
         }
-        self.active = self._detect()
-        print(f"  Retrosynthesis provider: {self.active}")
+        self._providers = {}
+        self._active_provider = None
+        # Do NOT call _detect() here; wait for first analyze() call
+
+    def _get_provider(self, name: str) -> RetrosynthesisProvider:
+        if name not in self._providers:
+            if name == "ibm_rxn":
+                self._providers[name] = IBMRXNProvider(api_key=self.api_keys["ibm"])
+            elif name == "askcos":
+                self._providers[name] = ASKCOSProvider(
+                    base_url=self.api_keys["askcos_url"], 
+                    api_key=self.api_keys["askcos_key"]
+                )
+            elif name == "mock":
+                self._providers[name] = MockRetrosynthesisProvider()
+        return self._providers[name]
 
     def _detect(self) -> str:
+        """Lazily determine the best available provider."""
         for name in ["ibm_rxn", "askcos"]:
-            if self.providers[name].is_available():
+            p = self._get_provider(name)
+            if p.is_available():
                 return name
         return "mock"
 
     def analyze(self, smiles: str, max_steps: int = 5) -> RetrosynthesisResult:
-        provider = self.providers[self.active]
+        if self._active_provider is None:
+            self._active_provider = self._detect()
+        
+        provider = self._get_provider(self._active_provider)
         result = provider.analyze(smiles, max_steps=max_steps)
 
         # Fallback on failure
-        if not result.success and self.active != "mock":
-            result = self.providers["mock"].analyze(smiles, max_steps=max_steps)
+        if not result.success and self._active_provider != "mock":
+            result = self._get_provider("mock").analyze(smiles, max_steps=max_steps)
 
         return result
+
 
 
 # ══════════════════════════════════════════════════════════════════════════

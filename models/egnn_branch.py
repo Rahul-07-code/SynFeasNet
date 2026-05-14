@@ -268,6 +268,8 @@ class EGNNLayer(nn.Module):
                 weighted
             )
 
+            # Stabilization: Clip coordinate updates to prevent exploding geometry
+            coord_agg = torch.clamp(coord_agg, min=-1.0, max=1.0)
             x_new = x + coord_agg
 
         else:
@@ -402,9 +404,32 @@ class Graph3DBuilder:
 
         return graph
 
-# ══════════════════════════════════════════════════════════════════════════
-# TEST
-# ══════════════════════════════════════════════════════════════════════════
+    def generate_scalar_features(self, smiles: str) -> list:
+        """
+        Generates basic 3D-derived scalar features for a molecule.
+        Used for baseline validation and metadata.
+        """
+        coords = self.conformer_gen.generate(smiles)
+        if coords is None:
+            return [0.0, 0.0, 0.0, 0.0]
+        
+        # 1. Mean distance from centroid
+        centroid = coords.mean(axis=0)
+        dists = np.linalg.norm(coords - centroid, axis=1)
+        mean_dist = dists.mean()
+        
+        # 2. Max distance (diameter proxy)
+        max_dist = dists.max()
+        
+        # 3. Radius of gyration
+        rog = np.sqrt(np.sum((coords - centroid)**2) / coords.shape[0])
+        
+        # 4. Average bond length (approximate)
+        # Since we don't have bond indices here, we use mean distance of nearest neighbors
+        # as a crude proxy for structural density
+        density = np.mean(np.sort(dists)[:5]) if len(dists) > 5 else 0.0
+        
+        return [float(mean_dist), float(max_dist), float(rog), float(density)]
 
 if __name__ == "__main__":
     from torch_geometric.data import Batch
