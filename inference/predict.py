@@ -29,7 +29,7 @@ Returns dict:
     }
 """
 
-import os, sys
+import os, sys, json
 import torch
 import numpy as np
 from torch_geometric.data import Batch
@@ -54,6 +54,7 @@ from models.egnn_branch      import Graph3DBuilder
 from spi_labels              import (
     SPILabelGenerator, SPI_CLASS_THRESHOLDS, FEASIBILITY_GATE_THRESHOLD
 )
+from retrosynthesis.engine   import RetrosynthesisEngine
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -195,6 +196,7 @@ _ANN_EXTRACTOR = None
 _GRAPH_BUILDER = None
 _TOKENIZER     = None
 _G3D_BUILDER   = None
+_RETRO_ENGINE  = None
 _MAX_LEN       = DEFAULT_MAX_LENGTH
 
 
@@ -252,6 +254,13 @@ def _ensure_loaded():
         _load_model()
 
 
+def _ensure_retro_loaded():
+    global _RETRO_ENGINE
+
+    if _RETRO_ENGINE is None:
+        _RETRO_ENGINE = RetrosynthesisEngine()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # INFERENCE HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -304,6 +313,75 @@ def _parse_output(out: dict, chemistry: dict, warning: str) -> dict:
     }
 
 
+def _retro_metric_defaults(result: dict) -> dict:
+    """Map SPI dimension scores to lightweight retrosynthesis scoring inputs."""
+    dimensions = result.get("spi_dimensions", {})
+
+    synthetic_complexity = float(
+        dimensions.get("synthetic_complexity", result.get("spi_score", 0.5))
+    )
+    retro_confidence = float(
+        dimensions.get("retro_confidence", result.get("spi_score", 0.5))
+    )
+    medchem_realism = float(
+        dimensions.get("medchem_realism", result.get("spi_score", 0.5))
+    )
+
+    return {
+        "spi_score": float(result.get("spi_score", 0.0)),
+        "sa_score": round(10.0 - 9.0 * synthetic_complexity, 4),
+        "scscore": round(5.0 - 4.0 * retro_confidence, 4),
+        "syba_score": round(medchem_realism, 4),
+    }
+
+
+def _run_retrosynthesis(smiles: str, result: dict) -> dict:
+    _ensure_retro_loaded()
+
+    metrics = _retro_metric_defaults(result)
+
+    try:
+        with _RETRO_LOCK:
+            retro_json = _RETRO_ENGINE.run_json(
+                smiles=smiles,
+                **metrics
+            )
+
+        retro_json["enabled"] = True
+        retro_json["scoring_inputs"] = metrics
+
+        if retro_json["status"] == "no_route":
+            retro_json["message"] = (
+                "No retrosynthesis route generated. The molecule may be a "
+                "macrocycle, invalid, already terminal, or outside the current "
+                "template coverage."
+            )
+
+        return retro_json
+
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "status": "error",
+            "target_smiles": smiles,
+            "error": str(exc),
+            "scoring_inputs": metrics,
+            "n_routes": 0,
+            "summary": {
+                "best_score": None,
+                "best_solved_fraction": 0.0,
+                "best_n_steps": 0,
+            },
+            "routes": [],
+            "visualization": {
+                "nodes": [],
+                "edges": [],
+                "layout": "tree",
+                "root_id": None,
+            },
+        }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PUBLIC API
 # ══════════════════════════════════════════════════════════════════════════════
@@ -312,8 +390,9 @@ import threading
 
 # Global lock for model inference to ensure thread-safety in FastAPI/multiprocessing
 _MODEL_LOCK = threading.Lock()
+_RETRO_LOCK = threading.Lock()
 
-def predict(smiles: str) -> dict:
+def predict(smiles: str, include_retrosynthesis: bool = True) -> dict:
     """
     Predict the Synthetic Practicality Index for a SMILES string.
     """
@@ -330,17 +409,28 @@ def predict(smiles: str) -> dict:
         with torch.no_grad():
             out = _MODEL(ann_feat, graph, input_ids, attn_mask)
 
-    return _parse_output(out, chemistry, warning)
+    result = _parse_output(out, chemistry, warning)
+
+    if include_retrosynthesis:
+        result["retrosynthesis"] = _run_retrosynthesis(
+            smiles,
+            result
+        )
+
+    return result
 
 
 
-def predict_batch(smiles_list: list) -> list:
+def predict_batch(smiles_list: list, include_retrosynthesis: bool = True) -> list:
     """Predict SPI for a list of SMILES strings."""
     _ensure_loaded()
     results = []
     for smi in smiles_list:
         try:
-            r = predict(smi)
+            r = predict(
+                smi,
+                include_retrosynthesis=include_retrosynthesis
+            )
             r["smiles"] = smi
             results.append(r)
         except Exception as e:
@@ -348,7 +438,11 @@ def predict_batch(smiles_list: list) -> list:
     return results
 
 
-def predict_with_uncertainty(smiles: str, n_samples: int = 20) -> dict:
+def predict_with_uncertainty(
+    smiles: str,
+    n_samples: int = 20,
+    include_retrosynthesis: bool = True
+) -> dict:
     """
     MC-Dropout uncertainty estimation.
     Returns standard predict() dict plus 'uncertainty' sub-dict.
@@ -387,6 +481,13 @@ def predict_with_uncertainty(smiles: str, n_samples: int = 20) -> dict:
             for i in range(len(SPI_DIMENSION_NAMES))
         },
     }
+
+    if include_retrosynthesis:
+        result["retrosynthesis"] = _run_retrosynthesis(
+            smiles,
+            result
+        )
+
     return result
 
 
@@ -412,6 +513,11 @@ if __name__ == "__main__":
         try:
             r = predict(smi)
             print(r["spi_report"])
+            print("\nRETROSYNTHESIS JSON")
+            print(json.dumps(
+                r.get("retrosynthesis", {}),
+                indent=2
+            ))
             if r["warning"]:
                 print(f"⚠  {r['warning']}")
         except Exception as e:

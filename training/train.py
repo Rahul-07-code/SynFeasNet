@@ -75,7 +75,7 @@ os.makedirs(SAVE_DIR,  exist_ok=True)
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 BATCH_SIZE     = 16
-EPOCHS         = 30
+EPOCHS         = 0
 LR             = 2e-4
 MAX_SMILES_LEN = 320
 ENTROPY_REG    = 0.05
