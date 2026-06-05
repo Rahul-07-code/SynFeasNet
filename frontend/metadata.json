@@ -1,0 +1,6 @@
+{
+  "name": "SynFeasNet",
+  "description": "AI Research Platform for Synthetic Feasibility and Retrosynthesis Molecule Evaluation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
