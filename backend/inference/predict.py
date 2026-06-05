@@ -219,8 +219,7 @@ def _load_model():
 
     _MODEL = SynPractIQModel(dropout=0.3).to(device)
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        _MODEL.load_state_dict(ckpt["state_dict"])
-        print(f"  Epoch     : {ckpt.get('epoch', '?')}")
+        _MODEL.load_state_dict(ckpt["state_dict"], strict=False)
         print(f"  Val SPI-MAE: {ckpt.get('val_spi_mae', '?')}")
         print(f"  Val ρ      : {ckpt.get('val_spearman', '?')}")
     else:
